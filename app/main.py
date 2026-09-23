@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -94,6 +94,27 @@ class JobIn(BaseModel):
         if any(not isinstance(d, str) or not d.strip() for d in value):
             raise ValueError("depends_on entries must be non-empty strings")
         return value
+
+
+class BatchIn(BaseModel):
+    now: datetime | None = Field(
+        default=None,
+        description=(
+            "Optional reference instant (UTC, ISO-8601) for aging settlement. "
+            "Omit to use the server clock. Passing the same value to a preview "
+            "and the subsequent real batch keeps their decisions identical."
+        ),
+        examples=["2026-09-23T12:00:00Z"],
+    )
+
+    def reference(self) -> datetime | None:
+        if self.now is None:
+            return None
+        # Match the service layer: naive timestamps are interpreted as UTC;
+        # offset-aware ones are normalised to UTC.
+        if self.now.tzinfo is None:
+            return self.now.replace(tzinfo=timezone.utc)
+        return self.now.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +217,32 @@ def get_queue():
 
 
 @app.post("/scheduler/batch", tags=["scheduler"])
-def schedule_next_batch():
-    """Run one WDRR+aging batch; returns selection order and balances."""
-    return scheduler.run_batch()
+def schedule_next_batch(body: BatchIn | None = None):
+    """Run one WDRR+aging batch; returns selection order and balances.
+
+    The request body is optional (a bare ``POST`` keeps the original
+    behaviour and uses the server clock as the reference instant).
+    """
+    return scheduler.run_batch(now=None if body is None else body.reference())
+
+
+@app.post("/scheduler/preview", tags=["scheduler"])
+def preview_next_batch(body: BatchIn | None = None):
+    """Dry-run a batch without writing anything.
+
+    Runs the exact same WDRR/aging/cap/dependency decision path as
+    ``/scheduler/batch`` inside a transaction that is rolled back, so the
+    response — predicted dispatch order, GPU usage after the batch, tenant
+    balances and credit events — matches the next committed batch at the same
+    reference instant on the same database state, while job statuses,
+    balances, aging clocks, batches and the ledger are all left untouched
+    (errors leave no partial changes). The response carries
+    ``"preview": true``; its ``batch_id``/event ids are prospective and are
+    not persisted.
+    """
+    return scheduler.preview_batch(
+        now=None if body is None else body.reference()
+    )
 
 
 @app.get("/ledger", tags=["scheduler"])

@@ -219,10 +219,15 @@ curl -X POST http://localhost:8000/jobs \
 
 ### 2. 调度下一批 `POST /scheduler/batch`
 
-执行一次 WDRR + 老化批次，返回**选择顺序**、每租户**余额**、容量使用与完整事件流水：
+执行一次 WDRR + 老化批次（**会落库**：作业转 RUNNING、扣减余额、写账本与批次），
+返回**选择顺序**、每租户**余额**、容量使用与完整事件流水：
 
 ```bash
 curl -X POST http://localhost:8000/scheduler/batch
+# 请求体可省略（沿用服务器当前时刻作为参考时刻）；也可显式传入参考时刻：
+curl -X POST http://localhost:8000/scheduler/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"now":"2026-09-23T12:00:00Z"}'
 ```
 
 ```jsonc
@@ -247,6 +252,63 @@ curl -X POST http://localhost:8000/scheduler/batch
     {"kind":"DISPATCH","tenant_id":"team-a","amount":-60.0,"job_id":"J000001"}
   ]
 }
+```
+
+### 2b. 预演下一批（dry-run，零写入）`POST /scheduler/preview`
+
+在**不写入任何数据**的前提下预演一次批次，返回与正式批次相同结构的结果：
+**预计派发顺序**、批次后的 **GPU 占用**、各租户**余额**与完整**信用事件**
+（`AGING / QUANTUM / DISPATCH`）。
+
+```bash
+curl -X POST http://localhost:8000/scheduler/preview
+# 或带可选参考时刻（UTC ISO-8601），便于把预演与随后正式批次对齐到同一时刻：
+curl -X POST http://localhost:8000/scheduler/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"now":"2026-09-23T12:00:00Z"}'
+```
+
+预演与 `POST /scheduler/batch` **共用同一套代码路径**——同一笔数据库事务内执行
+完全相同的 WDRR、老化结算、租户并发上限与依赖判定，唯一区别是事务结尾 **回滚**
+而非提交，因此两套算法不可能分叉：
+
+- **零写入**：作业保持 QUEUED、余额与老化计时点不变、`batches`/`ledger` 不新增行；
+  预演过程中**异常也会整体回滚**，绝不留下部分变更。
+- **结果可复现一致**：同一数据库状态、相同参考时刻（`now`）下，预演结果与随后
+  正式批次的决策逐项一致（派发顺序、`used/free_gpus_after`、`rounds`、事件金额与
+  余额、租户快照）；响应仅多出 `"preview": true` 标记。回滚的批次/账本自增行会被
+  随后的正式批次原样复用，因此连 `batch_id` 与事件 `id` 都一致，也不会产生 id 空洞。
+- 响应中的 `batch_id`/事件 `id` 为**预演用的预期值（prospective）**，并不持久化；
+  预演里 `selected_jobs` 的 `status: RUNNING`、`scheduled_at`、`batch_id` 同样只是
+  “若正式执行会是什么样”的预测视图。
+- 预演可**任意重复调用**：同刻重复预演结果一致，无法借预演“刷”量子或老化信用。
+- 空队列预演返回 `selection_order: []`、`events: []`，同样零写入。
+
+```jsonc
+// POST /scheduler/preview 的响应（与正式批次同构，仅多 preview 标记）
+{
+  "batch_id": 1,
+  "preview": true,
+  "capacity_gpus": 8,
+  "used_gpus_before": 0,
+  "used_gpus_after": 8,
+  "free_gpus_after": 0,
+  "rounds": 3,
+  "selection_order": ["J000001", "J000002"],
+  "selected_jobs": [ ... ],   // 预测视图：status 显示为 RUNNING，但库里仍为 QUEUED
+  "tenants": [ ... ],         // 预测的批次后余额/占用
+  "events": [ ... ]           // 预测的 AGING/QUANTUM/DISPATCH 流水（不入库）
+}
+```
+
+典型用法（先看后做，且结果对得上）：
+
+```bash
+curl -s -X POST localhost:8000/scheduler/preview \
+  -H 'Content-Type: application/json' -d '{"now":"2026-09-23T12:00:00Z"}'
+# 确认派发顺序/余额/占用符合预期后，用同一参考时刻正式执行：
+curl -s -X POST localhost:8000/scheduler/batch \
+  -H 'Content-Type: application/json' -d '{"now":"2026-09-23T12:00:00Z"}'
 ```
 
 ### 3. 完成 / 取消作业
@@ -343,7 +405,8 @@ curl -G "http://localhost:8000/usage/gpu" \
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
 | POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限 |
 | GET | `/tenants` / `/tenants/{id}` | 租户与余额 |
-| POST | `/scheduler/batch` | **调度下一批**，返回选择顺序与余额 |
+| POST | `/scheduler/batch` | **调度下一批（落库）**，返回选择顺序与余额；可选请求体 `{"now": <UTC ISO-8601>}` 指定参考时刻 |
+| POST | `/scheduler/preview` | **预演下一批（零写入，事务回滚）**：与 batch 同一套 WDRR/老化/上限/依赖判定，返回预测的派发顺序、批次后 GPU 占用、租户余额与信用事件；可选 `{"now": ...}` |
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
 | GET | `/queue` | 每租户 FIFO 队列与位置 |
 | GET | `/usage/gpu` | **按 UTC 时间窗汇总**每租户/全局 GPU-分钟与重叠作业数（可选 `tenant_id`） |
@@ -364,6 +427,7 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
 curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
   -d '{"tenant_id":"carol","gpus":4,"duration_min":10}'
 
+curl -s -X POST localhost:8000/scheduler/preview  # 先预演：预测派发 [J1,J2]、占满 8 GPU，但零写入
 curl -s -X POST localhost:8000/scheduler/batch        # => [J000001, J000002]，用满 8 GPU
 curl -s -X POST localhost:8000/scheduler/batch        # => []（容量不足，carol 等待并老化）
 curl -s -X POST localhost:8000/jobs/J000001/complete  # 释放 2，仍不足 4
@@ -407,7 +471,7 @@ curl -s -G localhost:8000/usage/gpu \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（50 个：服务层算法/依赖/用量汇总/租户 GPU 上限 + HTTP 端到端）
+# 运行全部测试（63 个：服务层算法/依赖/用量汇总/租户 GPU 上限/批次预演 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -429,6 +493,7 @@ scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
   test_scheduler.py  # 算法测试（注入时间，确定性断言）
+  test_preview.py    # 预演测试：与正式批次决策一致、零写入、异常回滚
   test_api.py        # HTTP 端到端测试
 Dockerfile
 docker-compose.yml

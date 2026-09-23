@@ -52,6 +52,19 @@ Tenant visit order is tenant-id ascending, jobs are FIFO per tenant, job ids
 are sequential, and ``run_batch`` accepts an injectable ``now``/seed-free
 logic: identical inputs always produce identical selection order.
 
+Batch preview
+=============
+``preview_batch`` runs the *same* transaction body as ``run_batch`` — WDRR,
+aging settlement, tenant caps and dependency readiness are one code path, not
+two copies — but rolls the transaction back instead of committing. A preview
+therefore writes nothing: no batch row, no ledger entries, no job status,
+balance or aging-clock changes, even on error. The only deliberate
+difference in the returned snapshot is ``preview: true`` (and the rollback
+itself). Because nothing is persisted, a preview followed by a real batch at
+the same reference instant on the same database state yields the same
+selection order, GPU usage, balances and credit events, and even reuses the
+same prospective batch/ledger row ids.
+
 Job dependencies
 ================
 ``POST /jobs`` accepts ``depends_on``: a list of job ids (from ANY tenant)
@@ -552,301 +565,363 @@ def run_batch(
     now: datetime | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Schedule the next batch of jobs.
+    """Schedule the next batch of jobs and commit every effect.
 
     Returns the selection order, per-tenant balances after the batch, capacity
     usage and an explainable ledger of credit/debit events.
     """
+    return _run_batch_transaction(now=now, settings=settings, persist=True)
+
+
+def preview_batch(
+    now: datetime | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Dry-run :func:`run_batch` without persisting anything.
+
+    The exact same batch transaction body executes (WDRR, aging, caps and
+    dependency checks — there is no second algorithm), after which the
+    transaction is rolled back: jobs stay QUEUED, balances/aging clocks are
+    untouched, and no batch or ledger row survives (a rollback on error leaves
+    no partial changes either). The returned snapshot is flagged
+    ``preview: true``; everything else — selection order, post-batch GPU
+    usage, balances and the full credit-event stream, including prospective
+    batch/ledger row ids — is what the subsequently committed batch at the
+    same reference instant on the same state will produce.
+    """
+    return _run_batch_transaction(now=now, settings=settings, persist=False)
+
+
+def _run_batch_transaction(
+    now: datetime | None,
+    settings: Settings | None,
+    persist: bool,
+) -> dict[str, Any]:
+    """Shared body of a real batch (``persist=True``) and a preview.
+
+    Both modes execute byte-identical decisions inside one explicit
+    transaction; only the boundary differs:
+
+    * ``persist=True``  -> ``COMMIT`` (``POST /scheduler/batch``);
+    * ``persist=False`` -> ``ROLLBACK`` (``POST /scheduler/preview``).
+
+    Any exception rolls back (a no-op for a clean preview), so an aborted
+    batch can never leave partial ledger/balance/job changes behind.
+    """
     settings = settings or get_settings()
-    now_str = _now_iso(now)
-    with db.get_lock(), db.get_conn():
+    if now is None:
+        now = datetime.now(timezone.utc)
+    now_str = _now_iso(_as_utc(now))
+    with db.get_lock():
         conn = db.get_conn()
         conn.execute("BEGIN IMMEDIATE")
-
-        used = conn.execute(
-            "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs WHERE status = ?",
-            (RUNNING,),
-        ).fetchone()["n"]
-        available = settings.cluster_gpus - used
-
-        cur = conn.execute(
-            """INSERT INTO batches
-                   (created_at, now_ref, capacity_gpus, used_gpus_before,
-                    available_gpus, rounds, jobs_selected)
-               VALUES (?, ?, ?, ?, ?, 0, 0)""",
-            (now_str, now_str, settings.cluster_gpus, used,
-             max(available, 0)),
-        )
-        batch_id = cur.lastrowid
-
-        active = conn.execute(
-            """SELECT DISTINCT j.tenant_id, t.weight, t.deficit,
-                              t.max_gpus, t.aging_settled_at
-                 FROM jobs j JOIN tenants t ON t.id = j.tenant_id
-                WHERE j.status = ?
-                ORDER BY j.tenant_id""",
-            (QUEUED,),
-        ).fetchall()
-
-        if not active:
-            conn.execute(
-                "UPDATE batches SET rounds = 0, jobs_selected = 0 WHERE id = ?",
-                (batch_id,),
-            )
+        try:
+            result = _batch_tx_body(conn, settings, now_str, preview=not persist)
+        except BaseException:
+            conn.rollback()
+            raise
+        if persist:
             conn.commit()
-            return _batch_result(conn, batch_id, settings)
+        else:
+            # Discard every tentative write: batch row, ledger entries, job
+            # status transitions, balance and aging-clock updates.
+            conn.rollback()
+        return result
 
-        # Dependency readiness is recomputed from the *current* head of each
-        # queue: only a COMPLETED prerequisite releases a job, and a tenant's
-        # next head (revealed after a dispatch) may itself be blocked. A
-        # tenant whose head-of-line job is blocked neither accrues aging nor
-        # spends quantum: waiting on another job is not scheduler starvation,
-        # and blocked batches must not hand out spendable credit.
-        def head_of(tenant_id: str):
-            return conn.execute(
-                """SELECT * FROM jobs
-                    WHERE tenant_id = ? AND status = ?
-                    ORDER BY queued_at, id LIMIT 1""",
-                (tenant_id, QUEUED),
-            ).fetchone()
 
-        def head_ready(head) -> bool:
-            return head is not None and not _unmet_prerequisites(
-                conn, head["id"]
-            )
+def _batch_tx_body(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    now_str: str,
+    preview: bool = False,
+) -> dict[str, Any]:
+    """The scheduling algorithm itself; operates only on ``conn``.
 
-        active_ids = [t["tenant_id"] for t in active]
-        ready_at_start = {
-            tid for tid in active_ids if head_ready(head_of(tid))
-        }
+    All writes are part of the caller's transaction, so the caller chooses
+    commit vs. rollback. The algorithm never sees whether this is a preview.
+    """
+    used = conn.execute(
+        "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs WHERE status = ?",
+        (RUNNING,),
+    ).fetchone()["n"]
+    available = settings.cluster_gpus - used
 
-        # Per-tenant concurrent-GPU caps (NULL = unlimited). Dispatch also
-        # respects each tenant's cap in addition to cluster capacity: the GPUs
-        # a tenant already has RUNNING plus the head job's request may not
-        # exceed its cap.
-        caps: dict[str, int | None] = {
-            t["tenant_id"]: t["max_gpus"] for t in active
-        }
-        tenant_running: dict[str, int] = {}
+    cur = conn.execute(
+        """INSERT INTO batches
+               (created_at, now_ref, capacity_gpus, used_gpus_before,
+                available_gpus, rounds, jobs_selected)
+           VALUES (?, ?, ?, ?, ?, 0, 0)""",
+        (now_str, now_str, settings.cluster_gpus, used,
+         max(available, 0)),
+    )
+    batch_id = cur.lastrowid
 
-        def running_gpus(tenant_id: str) -> int:
-            """GPUs currently held by the tenant's RUNNING jobs."""
-            row = conn.execute(
-                "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs "
-                "WHERE tenant_id = ? AND status = ?",
-                (tenant_id, RUNNING),
-            ).fetchone()
-            return int(row["n"])
+    active = conn.execute(
+        """SELECT DISTINCT j.tenant_id, t.weight, t.deficit,
+                          t.max_gpus, t.aging_settled_at
+             FROM jobs j JOIN tenants t ON t.id = j.tenant_id
+            WHERE j.status = ?
+            ORDER BY j.tenant_id""",
+        (QUEUED,),
+    ).fetchall()
 
-        for tid in active_ids:
-            tenant_running[tid] = running_gpus(tid)
+    if not active:
+        conn.execute(
+            "UPDATE batches SET rounds = 0, jobs_selected = 0 WHERE id = ?",
+            (batch_id,),
+        )
+        return _batch_result(conn, batch_id, settings, preview)
 
-        def tenant_can_fit(tenant_id: str, head_gpus: int, free_gpus: int) -> bool:
-            """Head job must fit both the free cluster capacity and the
-            tenant's own concurrent-GPU cap."""
-            if head_gpus > free_gpus:
-                return False
-            cap = caps.get(tenant_id)
-            if cap is not None and tenant_running[tenant_id] + head_gpus > cap:
-                return False
-            return True
+    # Dependency readiness is recomputed from the *current* head of each
+    # queue: only a COMPLETED prerequisite releases a job, and a tenant's
+    # next head (revealed after a dispatch) may itself be blocked. A
+    # tenant whose head-of-line job is blocked neither accrues aging nor
+    # spends quantum: waiting on another job is not scheduler starvation,
+    # and blocked batches must not hand out spendable credit.
+    def head_of(tenant_id: str):
+        return conn.execute(
+            """SELECT * FROM jobs
+                WHERE tenant_id = ? AND status = ?
+                ORDER BY queued_at, id LIMIT 1""",
+            (tenant_id, QUEUED),
+        ).fetchone()
 
-        # Aging is settled even when the cluster is full, so waiting tenants
-        # keep accumulating starvation compensation across blocked batches.
-        # --- Aging settlement at batch start -------------------------------
-        # Compensation covers the full wait since the oldest queued job's
-        # arrival: on first observation we settle from queued_at, afterwards
-        # from the previous settlement instant. Same-instant retries grant
-        # nothing, so the endpoint cannot be farmed via aging either.
-        # Dependency-blocked tenants receive nothing, but their checkpoint is
-        # advanced: once dependencies release them, waiting is measured from
-        # the release point rather than the original submission.
-        for t in active:
-            if t["tenant_id"] not in ready_at_start:
-                conn.execute(
-                    "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (now_str, now_str, t["tenant_id"]),
-                )
-                continue
-            oldest = conn.execute(
-                "SELECT MIN(queued_at) AS ts FROM jobs "
-                "WHERE tenant_id = ? AND status = ?",
-                (t["tenant_id"], QUEUED),
-            ).fetchone()["ts"]
-            base = t["aging_settled_at"] or oldest
-            waited_min = (
-                _parse_iso(now_str) - _parse_iso(base)
-            ).total_seconds() / 60.0
-            if waited_min < 0:
-                waited_min = 0.0
-            bonus = settings.aging_rate_gpu_min_per_min * waited_min
-            if settings.aging_cap_gpu_min is not None:
-                bonus = min(bonus, settings.aging_cap_gpu_min)
-            if bonus >= _EPS:
-                _credit(
-                    conn, t["tenant_id"], bonus, "AGING", now_str,
-                    batch_id=batch_id,
-                    detail=f"waited {waited_min:.3f} min",
-                )
+    def head_ready(head) -> bool:
+        return head is not None and not _unmet_prerequisites(
+            conn, head["id"]
+        )
+
+    active_ids = [t["tenant_id"] for t in active]
+    ready_at_start = {
+        tid for tid in active_ids if head_ready(head_of(tid))
+    }
+
+    # Per-tenant concurrent-GPU caps (NULL = unlimited). Dispatch also
+    # respects each tenant's cap in addition to cluster capacity: the GPUs
+    # a tenant already has RUNNING plus the head job's request may not
+    # exceed its cap.
+    caps: dict[str, int | None] = {
+        t["tenant_id"]: t["max_gpus"] for t in active
+    }
+    tenant_running: dict[str, int] = {}
+
+    def running_gpus(tenant_id: str) -> int:
+        """GPUs currently held by the tenant's RUNNING jobs."""
+        row = conn.execute(
+            "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs "
+            "WHERE tenant_id = ? AND status = ?",
+            (tenant_id, RUNNING),
+        ).fetchone()
+        return int(row["n"])
+
+    for tid in active_ids:
+        tenant_running[tid] = running_gpus(tid)
+
+    def tenant_can_fit(tenant_id: str, head_gpus: int, free_gpus: int) -> bool:
+        """Head job must fit both the free cluster capacity and the
+        tenant's own concurrent-GPU cap."""
+        if head_gpus > free_gpus:
+            return False
+        cap = caps.get(tenant_id)
+        if cap is not None and tenant_running[tenant_id] + head_gpus > cap:
+            return False
+        return True
+
+    # Aging is settled even when the cluster is full, so waiting tenants
+    # keep accumulating starvation compensation across blocked batches.
+    # --- Aging settlement at batch start -------------------------------
+    # Compensation covers the full wait since the oldest queued job's
+    # arrival: on first observation we settle from queued_at, afterwards
+    # from the previous settlement instant. Same-instant retries grant
+    # nothing, so the endpoint cannot be farmed via aging either.
+    # Dependency-blocked tenants receive nothing, but their checkpoint is
+    # advanced: once dependencies release them, waiting is measured from
+    # the release point rather than the original submission.
+    for t in active:
+        if t["tenant_id"] not in ready_at_start:
             conn.execute(
                 "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
                 "WHERE id = ?",
                 (now_str, now_str, t["tenant_id"]),
             )
-
-        if available <= 0:
-            conn.execute(
-                "UPDATE batches SET rounds = 0, jobs_selected = 0 WHERE id = ?",
-                (batch_id,),
+            continue
+        oldest = conn.execute(
+            "SELECT MIN(queued_at) AS ts FROM jobs "
+            "WHERE tenant_id = ? AND status = ?",
+            (t["tenant_id"], QUEUED),
+        ).fetchone()["ts"]
+        base = t["aging_settled_at"] or oldest
+        waited_min = (
+            _parse_iso(now_str) - _parse_iso(base)
+        ).total_seconds() / 60.0
+        if waited_min < 0:
+            waited_min = 0.0
+        bonus = settings.aging_rate_gpu_min_per_min * waited_min
+        if settings.aging_cap_gpu_min is not None:
+            bonus = min(bonus, settings.aging_cap_gpu_min)
+        if bonus >= _EPS:
+            _credit(
+                conn, t["tenant_id"], bonus, "AGING", now_str,
+                batch_id=batch_id,
+                detail=f"waited {waited_min:.3f} min",
             )
-            conn.commit()
-            return _batch_result(conn, batch_id, settings)
-
-        # --- WDRR rounds ----------------------------------------------------
-        # A tenant is visited in a round only while its head job FITS the
-        # currently free capacity AND the tenant's own concurrent-GPU cap.
-        # Fitting-but-unaffordable jobs keep accumulating quantum across rounds
-        # until affordable. A tenant whose head job cannot physically fit —
-        # blocked by cluster capacity OR by its tenant cap (running jobs
-        # already filling it, or the head alone exceeding it) — accrues no
-        # quantum this round: waiting for completions/cancellations is
-        # compensated by aging, and this prevents callers farming quantum by
-        # repeatedly invoking the endpoint. Other tenants are unaffected:
-        # each tenant's eligibility is evaluated independently, so a capped
-        # tenant is simply skipped while the rest still dispatch.
-        #
-        # Each round's grants are tentative above a commit watermark. The
-        # moment a round produces a dispatch, every grant up to that point is
-        # committed (it is ordinary DRR accrual). When the batch ends without
-        # a trailing dispatch (e.g. max_rounds exhausted), the uncommitted
-        # grants are rolled back so blocked calls leave balances unchanged.
-        selected: list[str] = []
-        run_index = 0
-        rounds = 0
-        free = available
-        commit_mark = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM ledger"
-        ).fetchone()["m"]
-
-        def rollback_uncommitted() -> None:
-            rows = conn.execute(
-                "SELECT tenant_id, amount FROM ledger WHERE id > ?",
-                (commit_mark,),
-            ).fetchall()
-            for r in rows:
-                conn.execute(
-                    "UPDATE tenants SET deficit = deficit - ? WHERE id = ?",
-                    (r["amount"], r["tenant_id"]),
-                )
-            conn.execute("DELETE FROM ledger WHERE id > ?", (commit_mark,))
-
-        while rounds < settings.max_rounds:
-            fitting = []
-            for tid in active_ids:
-                h = head_of(tid)
-                if (
-                    h is not None
-                    and head_ready(h)
-                    and tenant_can_fit(tid, h["gpus"], free)
-                ):
-                    fitting.append(tid)
-            if not fitting:
-                break  # every queued job is capacity/cap/dependency-blocked
-
-            rounds += 1
-            dispatched_this_round = False
-
-            for tenant_id in fitting:
-                if free <= 0:
-                    break
-                head = head_of(tenant_id)
-                if head is None or not head_ready(head) or not tenant_can_fit(
-                    tenant_id, head["gpus"], free
-                ):
-                    # Became ineligible after earlier tenants in this round
-                    # (free GPUs consumed, or the tenant used its cap headroom).
-                    continue
-
-                weight = conn.execute(
-                    "SELECT weight FROM tenants WHERE id = ?", (tenant_id,)
-                ).fetchone()["weight"]
-                quantum = settings.base_quantum_gpu_min * float(weight)
-                _credit(
-                    conn, tenant_id, quantum, "QUANTUM", now_str,
-                    batch_id=batch_id, detail=f"round {rounds}",
-                )
-
-                bal = conn.execute(
-                    "SELECT deficit FROM tenants WHERE id = ?", (tenant_id,)
-                ).fetchone()["deficit"]
-                cost = head["cost_gpu_min"]
-
-                if bal + _EPS < cost:
-                    continue  # keep accruing in later rounds
-                # Capacity and cap invariants: never crossed.
-                if not tenant_can_fit(tenant_id, head["gpus"], free):
-                    continue
-
-                run_index += 1
-                conn.execute(
-                    """UPDATE jobs
-                          SET status = ?, scheduled_at = ?, batch_id = ?,
-                              run_index = ?
-                        WHERE id = ?""",
-                    (RUNNING, now_str, batch_id, run_index, head["id"]),
-                )
-                _credit(
-                    conn, tenant_id, -cost, "DISPATCH", now_str,
-                    batch_id=batch_id, job_id=head["id"],
-                    detail=f"{head['gpus']} GPU x {head['duration_min']} min",
-                )
-                selected.append(head["id"])
-                free -= head["gpus"]
-                tenant_running[tenant_id] += head["gpus"]
-                dispatched_this_round = True
-
-            if dispatched_this_round:
-                # All accrual that led to this dispatch is now permanent.
-                commit_mark = conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) AS m FROM ledger"
-                ).fetchone()["m"]
-            # Idle rounds are normal while tenants are still accruing toward
-            # affordability (positive weights guarantee they get there); the
-            # loop continues until dispatch or no job fits any longer.
-
-        # Grants above the commit watermark never led to a dispatch (idle
-        # trailing rounds, or a batch cut off by max_rounds): roll them back
-        # so that invoking the endpoint while blocked leaves balances and the
-        # ledger untouched.
-        rollback_uncommitted()
-
-        # Close aging windows for tenants whose queue drained; others keep
-        # accruing wait time from this batch's reference instant.
-        for tenant_id in active_ids:
-            if _has_queued(conn, tenant_id):
-                conn.execute(
-                    "UPDATE tenants SET aging_settled_at = ? WHERE id = ?",
-                    (now_str, tenant_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tenants SET aging_settled_at = NULL WHERE id = ?",
-                    (tenant_id,),
-                )
-
         conn.execute(
-            "UPDATE batches SET rounds = ?, jobs_selected = ? WHERE id = ?",
-            (rounds, len(selected), batch_id),
+            "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (now_str, now_str, t["tenant_id"]),
         )
-        conn.commit()
-        return _batch_result(conn, batch_id, settings)
+
+    if available <= 0:
+        conn.execute(
+            "UPDATE batches SET rounds = 0, jobs_selected = 0 WHERE id = ?",
+            (batch_id,),
+        )
+        return _batch_result(conn, batch_id, settings, preview)
+
+    # --- WDRR rounds ----------------------------------------------------
+    # A tenant is visited in a round only while its head job FITS the
+    # currently free capacity AND the tenant's own concurrent-GPU cap.
+    # Fitting-but-unaffordable jobs keep accumulating quantum across rounds
+    # until affordable. A tenant whose head job cannot physically fit —
+    # blocked by cluster capacity OR by its tenant cap (running jobs
+    # already filling it, or the head alone exceeding it) — accrues no
+    # quantum this round: waiting for completions/cancellations is
+    # compensated by aging, and this prevents callers farming quantum by
+    # repeatedly invoking the endpoint. Other tenants are unaffected:
+    # each tenant's eligibility is evaluated independently, so a capped
+    # tenant is simply skipped while the rest still dispatch.
+    #
+    # Each round's grants are tentative above a commit watermark. The
+    # moment a round produces a dispatch, every grant up to that point is
+    # committed (it is ordinary DRR accrual). When the batch ends without
+    # a trailing dispatch (e.g. max_rounds exhausted), the uncommitted
+    # grants are rolled back so blocked calls leave balances unchanged.
+    selected: list[str] = []
+    run_index = 0
+    rounds = 0
+    free = available
+    commit_mark = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS m FROM ledger"
+    ).fetchone()["m"]
+
+    def rollback_uncommitted() -> None:
+        rows = conn.execute(
+            "SELECT tenant_id, amount FROM ledger WHERE id > ?",
+            (commit_mark,),
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE tenants SET deficit = deficit - ? WHERE id = ?",
+                (r["amount"], r["tenant_id"]),
+            )
+        conn.execute("DELETE FROM ledger WHERE id > ?", (commit_mark,))
+
+    while rounds < settings.max_rounds:
+        fitting = []
+        for tid in active_ids:
+            h = head_of(tid)
+            if (
+                h is not None
+                and head_ready(h)
+                and tenant_can_fit(tid, h["gpus"], free)
+            ):
+                fitting.append(tid)
+        if not fitting:
+            break  # every queued job is capacity/cap/dependency-blocked
+
+        rounds += 1
+        dispatched_this_round = False
+
+        for tenant_id in fitting:
+            if free <= 0:
+                break
+            head = head_of(tenant_id)
+            if head is None or not head_ready(head) or not tenant_can_fit(
+                tenant_id, head["gpus"], free
+            ):
+                # Became ineligible after earlier tenants in this round
+                # (free GPUs consumed, or the tenant used its cap headroom).
+                continue
+
+            weight = conn.execute(
+                "SELECT weight FROM tenants WHERE id = ?", (tenant_id,)
+            ).fetchone()["weight"]
+            quantum = settings.base_quantum_gpu_min * float(weight)
+            _credit(
+                conn, tenant_id, quantum, "QUANTUM", now_str,
+                batch_id=batch_id, detail=f"round {rounds}",
+            )
+
+            bal = conn.execute(
+                "SELECT deficit FROM tenants WHERE id = ?", (tenant_id,)
+            ).fetchone()["deficit"]
+            cost = head["cost_gpu_min"]
+
+            if bal + _EPS < cost:
+                continue  # keep accruing in later rounds
+            # Capacity and cap invariants: never crossed.
+            if not tenant_can_fit(tenant_id, head["gpus"], free):
+                continue
+
+            run_index += 1
+            conn.execute(
+                """UPDATE jobs
+                      SET status = ?, scheduled_at = ?, batch_id = ?,
+                          run_index = ?
+                    WHERE id = ?""",
+                (RUNNING, now_str, batch_id, run_index, head["id"]),
+            )
+            _credit(
+                conn, tenant_id, -cost, "DISPATCH", now_str,
+                batch_id=batch_id, job_id=head["id"],
+                detail=f"{head['gpus']} GPU x {head['duration_min']} min",
+            )
+            selected.append(head["id"])
+            free -= head["gpus"]
+            tenant_running[tenant_id] += head["gpus"]
+            dispatched_this_round = True
+
+        if dispatched_this_round:
+            # All accrual that led to this dispatch is now permanent.
+            commit_mark = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM ledger"
+            ).fetchone()["m"]
+        # Idle rounds are normal while tenants are still accruing toward
+        # affordability (positive weights guarantee they get there); the
+        # loop continues until dispatch or no job fits any longer.
+
+    # Grants above the commit watermark never led to a dispatch (idle
+    # trailing rounds, or a batch cut off by max_rounds): roll them back
+    # so that invoking the endpoint while blocked leaves balances and the
+    # ledger untouched.
+    rollback_uncommitted()
+
+    # Close aging windows for tenants whose queue drained; others keep
+    # accruing wait time from this batch's reference instant.
+    for tenant_id in active_ids:
+        if _has_queued(conn, tenant_id):
+            conn.execute(
+                "UPDATE tenants SET aging_settled_at = ? WHERE id = ?",
+                (now_str, tenant_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tenants SET aging_settled_at = NULL WHERE id = ?",
+                (tenant_id,),
+            )
+
+    conn.execute(
+        "UPDATE batches SET rounds = ?, jobs_selected = ? WHERE id = ?",
+        (rounds, len(selected), batch_id),
+    )
+    return _batch_result(conn, batch_id, settings, preview)
 
 
 def _batch_result(
     conn: sqlite3.Connection,
     batch_id: int,
     settings: Settings,
+    preview: bool = False,
 ) -> dict[str, Any]:
     batch = conn.execute(
         "SELECT * FROM batches WHERE id = ?", (batch_id,)
@@ -861,6 +936,9 @@ def _batch_result(
     ).fetchone()["n"]
     return {
         "batch_id": batch["id"],
+        # False for a committed batch; True for a rolled-back preview whose
+        # batch_id/ledger ids are only prospective (never persisted).
+        "preview": preview,
         "created_at": batch["created_at"],
         "capacity_gpus": batch["capacity_gpus"],
         "used_gpus_before": batch["used_gpus_before"],
