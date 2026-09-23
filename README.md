@@ -55,6 +55,10 @@ cost_gpu_min = gpus × duration_min        # GPU-分钟
 
 ### 加权 DRR（每次 `POST /scheduler/batch`）
 
+> `POST /scheduler/preview`（预演）与本流程调用**同一个批次核心**：同样的 WDRR、
+> 老化、租户上限与依赖判定，只是计算完整体回滚而不提交，故两者在同一状态与参考
+> 时刻下结论一致；详见下文「预演下一批」。
+
 1. 取所有含 QUEUED 作业的租户，按**租户 id 升序**固定排列。
 2. 每个 DRR 轮次，每位“队首作业**同时**能放入当前空闲 GPU、且未超过本租户并发
    GPU 上限（见下节）”的租户获得 `BASE_QUANTUM_GPU_MIN × weight` 的 QUANTUM 信用。
@@ -249,7 +253,56 @@ curl -X POST http://localhost:8000/scheduler/batch
 }
 ```
 
-### 3. 完成 / 取消作业
+### 3. 预演下一批 `POST /scheduler/preview`（不写入）
+
+在真正调度前先“试算”一批：返回与 `POST /scheduler/batch` **完全相同形状**的结果——
+预计派发顺序（`selection_order` / `selected_jobs`）、批次后 GPU 占用
+（`used_gpus_after` / `free_gpus_after`）、各租户预计余额（`tenants`）以及将产生的
+全部信用事件流水（`events`：`AGING / QUANTUM / DISPATCH`），但**不做任何持久化**。
+
+```bash
+curl -X POST http://localhost:8000/scheduler/preview
+```
+
+```jsonc
+{
+  "batch_id": null,              // 预演不落 batches 表，id 恒为 null
+  "preview": true,
+  "capacity_gpus": 8,
+  "used_gpus_before": 0,
+  "used_gpus_after": 8,
+  "free_gpus_after": 0,
+  "selection_order": ["J000001", "J000002"],
+  "selected_jobs": [ { "id": "J000001", "status": "RUNNING", "batch_id": null, ... } ],
+  "tenants": [ { "id": "team-a", "balance_gpu_min": 0.0, "running_gpus": 1, ... } ],
+  "events": [
+    { "id": null, "batch_id": null, "kind": "AGING",   "tenant_id": "team-a", ... },
+    { "id": null, "batch_id": null, "kind": "QUANTUM", "tenant_id": "team-a", ... },
+    { "id": null, "batch_id": null, "kind": "DISPATCH","tenant_id": "team-a", ... }
+  ]
+}
+```
+
+预演与正式批次的一致性保证：
+
+- **同一套算法、零分叉**：`preview` 与 `batch` 调用同一个批次核心
+  （`scheduler._execute_batch`），WDRR 轮次、老化补偿、租户 `max_gpus` 上限、
+  依赖（`depends_on`）就绪判定逻辑完全一致，不存在“第二套调度器”。
+- **同一数据库状态、同一参考时刻下结果一致**：预演在一个事务里完成全部计算后
+  **回滚**，因此随后的正式批次看到的状态与预演完全相同，决策也相同。HTTP 调用两个
+  端点都以“当前时刻”为参考时刻，所以紧接预演之后立刻正式调度时，唯一可能的差别是
+  两次调用之间流逝的亚秒级老化信用（服务层可注入相同 `now` 做逐字段精确比对）。
+- **不留任何写入**：预演结束后作业状态、租户余额、老化计时点（`aging_settled_at`）、
+  `batches`、`ledger` 全部保持原样，连自增批次 id 序列也会回滚（预演后首个正式批次
+  仍是 `batch_id: 1`）；`selected_jobs` 中的 `status: "RUNNING"` 仅表示**预计**结果，
+  数据库中的作业依旧是 `QUEUED`。
+- **异常也不留部分变更**：预演过程中任何异常都会整体回滚，不会出现“扣了余额但没派发”
+  之类的半成品状态。
+
+可安全地重复调用：预演不推进老化计时、不消耗量子、不改占用，重复预演同一问题得到
+同一答案。适合在正式批次前做容量规划或向调用方解释“为什么这个作业这轮没被选中”。
+
+### 4. 完成 / 取消作业
 
 ```bash
 curl -X POST http://localhost:8000/jobs/J000001/complete   # RUNNING -> COMPLETED，释放 GPU
@@ -258,7 +311,7 @@ curl -X POST http://localhost:8000/jobs/J000002/cancel     # QUEUED/RUNNING -> C
 
 - 只有 RUNNING 可 complete（否则 409）；已结束作业重复取消 409；不存在 404。
 
-### 4. 查询队列 / 作业 / 租户 / 流水
+### 5. 查询队列 / 作业 / 租户 / 流水
 
 ```bash
 curl http://localhost:8000/queue                    # 每租户 FIFO 队列、位置、权重、余额
@@ -289,7 +342,7 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 }
 ```
 
-### 5. 按时间窗汇总 GPU 用量 `GET /usage/gpu`
+### 6. 按时间窗汇总 GPU 用量 `GET /usage/gpu`
 
 按 UTC 时间窗 `[start, end)`（**左闭右开**）汇总每租户与全局的实际 GPU 用量：
 
@@ -343,7 +396,8 @@ curl -G "http://localhost:8000/usage/gpu" \
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
 | POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限 |
 | GET | `/tenants` / `/tenants/{id}` | 租户与余额 |
-| POST | `/scheduler/batch` | **调度下一批**，返回选择顺序与余额 |
+| POST | `/scheduler/batch` | **调度下一批**，返回选择顺序与余额（持久化） |
+| POST | `/scheduler/preview` | **预演下一批**：同一套算法试算顺序/GPU 占用/余额/事件，事务回滚、零写入 |
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
 | GET | `/queue` | 每租户 FIFO 队列与位置 |
 | GET | `/usage/gpu` | **按 UTC 时间窗汇总**每租户/全局 GPU-分钟与重叠作业数（可选 `tenant_id`） |
@@ -365,6 +419,12 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
   -d '{"tenant_id":"carol","gpus":4,"duration_min":10}'
 
 curl -s -X POST localhost:8000/scheduler/batch        # => [J000001, J000002]，用满 8 GPU
+
+# 正式调度前先预演：同样的试算结果，但作业仍 QUEUED、余额/老化/批次/账本均不写入
+curl -s -X POST localhost:8000/scheduler/preview       # => {"preview":true,"batch_id":null,"selection_order":[...], ...}
+curl -s localhost:8000/ledger                          # => []（预演不留任何账本记录）
+curl -s -X POST localhost:8000/scheduler/batch         # 正式批次的决策与预演一致（batch_id 仍从 1 开始）
+
 curl -s -X POST localhost:8000/scheduler/batch        # => []（容量不足，carol 等待并老化）
 curl -s -X POST localhost:8000/jobs/J000001/complete  # 释放 2，仍不足 4
 curl -s -X POST localhost:8000/jobs/J000002/complete  # 再释放 6
@@ -407,7 +467,7 @@ curl -s -G localhost:8000/usage/gpu \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（50 个：服务层算法/依赖/用量汇总/租户 GPU 上限 + HTTP 端到端）
+# 运行全部测试（59 个：服务层算法/依赖/用量汇总/租户 GPU 上限/预演零写入 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）

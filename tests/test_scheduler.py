@@ -773,3 +773,191 @@ def test_max_gpus_column_migrated_from_legacy_database(tmp_path, monkeypatch):
     finally:
         db_mod.reset_for_tests()
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Batch preview (dry run: same algorithm, zero persistence)
+# ---------------------------------------------------------------------------
+
+def _full_snapshot() -> dict[str, list[tuple]]:
+    """Every persistent table's contents, so a test can prove a preview left
+    not a single row (nor an updated column) behind."""
+    conn = db.get_conn()
+    return {
+        name: [tuple(row) for row in conn.execute(
+            f"SELECT * FROM {name}")]
+        for name in (
+            "tenants", "jobs", "batches", "ledger", "job_dependencies",
+        )
+    }
+
+
+def _normalized_events(events):
+    """Event identity independent of row/batch ids (which previews null out)."""
+    return [
+        (e["kind"], e["tenant_id"], e["job_id"], round(e["amount"], 9),
+         e["detail"])
+        for e in events
+    ]
+
+
+def test_preview_matches_batch_and_persists_nothing(conn):
+    submit("a", 1, 30, weight=1.0, when=iso(0))
+    submit("b", 1, 30, weight=3.0, when=iso(1))
+    submit("b", 1, 30, weight=3.0, when=iso(2))
+
+    snap = _full_snapshot()
+    p = scheduler.preview_batch(now=at(10))
+    assert p["preview"] is True
+    assert p["batch_id"] is None
+    assert p["selection_order"] == ["J000001", "J000002", "J000003"]
+    assert p["rounds"] == 2
+    assert p["used_gpus_after"] == 3 and p["free_gpus_after"] == 5
+
+    # No table was written or modified in any way.
+    assert _full_snapshot() == snap
+    # ...yet the projection speaks as if the batch had run: dispatched heads
+    # are projected RUNNING, but nothing references the unpersisted batch id.
+    assert all(j["status"] == "RUNNING" and j["batch_id"] is None
+               for j in p["selected_jobs"])
+    assert all(e["id"] is None and e["batch_id"] is None
+               for e in p["events"])
+    assert all(j["status"] == "QUEUED" for j in scheduler.list_jobs())
+    assert all(t["balance_gpu_min"] == 0.0 for t in scheduler.list_tenants())
+    assert all(t["aging_settled_at"] is None
+               for t in scheduler.list_tenants())
+
+    # Real batch at the same reference instant: identical decisions, events
+    # and balances. It is also batch id 1 (the preview's batch row and even
+    # the AUTOINCREMENT sequence rolled back).
+    r = scheduler.run_batch(now=at(10))
+    # Real responses carry no preview flag and persist the batch.
+    assert "preview" not in r
+    assert r["batch_id"] == 1
+    assert r["created_at"] == p["created_at"]
+    assert r["selection_order"] == p["selection_order"]
+    assert r["rounds"] == p["rounds"]
+    assert r["used_gpus_after"] == p["used_gpus_after"]
+    assert r["free_gpus_after"] == p["free_gpus_after"]
+    assert _normalized_events(r["events"]) == _normalized_events(p["events"])
+    rb = {t["id"]: t["balance_gpu_min"] for t in r["tenants"]}
+    pb = {t["id"]: t["balance_gpu_min"] for t in p["tenants"]}
+    assert rb == pytest.approx(pb)
+    # a: aging 10 + quantum 60 - cost 30 = 40
+    # b: aging 9 + 2 rounds x 180 quantum - 2 x 30 cost = 309
+    assert pb == pytest.approx({"a": 40.0, "b": 309.0})
+
+
+def test_preview_multi_round_accrual_matches_batch(conn):
+    # Both jobs cost 600; quantum 60/round -> 10 accrual rounds.
+    submit("a", 6, 100, weight=1.0, when=iso(0))
+    submit("b", 6, 100, weight=1.0, when=iso(1))
+
+    snap = _full_snapshot()
+    p = scheduler.preview_batch(now=at(10))
+    assert p["rounds"] == 10
+    assert p["selection_order"] == ["J000001"]
+    assert _full_snapshot() == snap
+
+    r = scheduler.run_batch(now=at(10))
+    assert (r["rounds"], r["selection_order"]) == (
+        p["rounds"], p["selection_order"])
+    assert _normalized_events(r["events"]) == _normalized_events(p["events"])
+    assert balances() == pytest.approx({"a": 10.0, "b": 549.0})
+
+
+def test_preview_while_blocked_is_repeatable_and_persists_nothing(conn):
+    submit("a", 8, 10, weight=4.0, when=iso(0))   # saturates cluster
+    submit("b", 1, 5, weight=1.0, when=iso(0))    # capacity-blocked
+
+    snap = _full_snapshot()
+    p1 = scheduler.preview_batch(now=at(10))
+    assert p1["selection_order"] == ["J000001"]
+    assert _full_snapshot() == snap
+    # Same question at the same instant gives the same answer, still no writes
+    # (the checkpoint advance and aging grant both rolled back).
+    p2 = scheduler.preview_batch(now=at(10))
+    assert p2["selection_order"] == ["J000001"]
+    assert _normalized_events(p2["events"]) == _normalized_events(p1["events"])
+    assert _full_snapshot() == snap
+
+    # Actually dispatch; afterwards the cluster is full and b still waits.
+    r = scheduler.run_batch(now=at(10))
+    assert r["selection_order"] == ["J000001"]
+    after_real = _full_snapshot()
+    p3 = scheduler.preview_batch(now=at(10))
+    assert p3["selection_order"] == []
+    assert p3["rounds"] == 0
+    assert all(e["kind"] != "QUANTUM" for e in p3["events"])
+    # Same-instant retry: no fresh aging either, and nothing is written.
+    assert _full_snapshot() == after_real
+
+
+def test_preview_respects_caps_and_dependencies(conn):
+    scheduler.upsert_tenant("a", 1.0, max_gpus=1)
+    pre = submit("other", 8, 5, when=iso(0))                    # saturates
+    dep = submit("a", 1, 5, when=iso(1), depends_on=[pre["id"]])
+    submit("a", 1, 5, when=iso(2))                              # behind head
+
+    snap = _full_snapshot()
+    p = scheduler.preview_batch(now=at(10))
+    assert p["selection_order"] == [pre["id"]]
+    # Dependency-blocked head earns nothing at all.
+    assert all(e["tenant_id"] != "a" for e in p["events"])
+    assert _full_snapshot() == snap
+
+    # Real run dispatches the prerequisite; completing it releases a's head.
+    assert scheduler.run_batch(now=at(10))["selection_order"] == [pre["id"]]
+    scheduler.complete_job(pre["id"])
+
+    p2 = scheduler.preview_batch(now=at(11))
+    # dep fits the cap (1 GPU); the job behind it stays cap-blocked.
+    assert p2["selection_order"] == [dep["id"]]
+    a = next(t for t in p2["tenants"] if t["id"] == "a")
+    assert a["running_gpus"] == 1 and a["max_gpus"] == 1
+    # Projection only: dep is still QUEUED in the database.
+    assert scheduler.get_job(dep["id"])["status"] == "QUEUED"
+    assert scheduler.get_job("J000003")["status"] == "QUEUED"
+
+
+def test_preview_with_empty_queue_projects_empty_batch(conn):
+    snap = _full_snapshot()
+    p = scheduler.preview_batch(now=at(0))
+    assert p["preview"] is True and p["batch_id"] is None
+    assert p["selection_order"] == []
+    assert p["selected_jobs"] == [] and p["events"] == []
+    assert p["rounds"] == 0
+    assert _full_snapshot() == snap
+    # Next real batch still gets id 1.
+    assert scheduler.run_batch(now=at(0))["batch_id"] == 1
+
+
+def test_preview_error_rolls_back_everything(conn, monkeypatch):
+    submit("a", 1, 30, weight=1.0, when=iso(0))
+    snap = _full_snapshot()
+    calls = {"n": 0}
+    real_credit = scheduler._credit
+
+    def failing_credit(conn_, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated storage failure")
+        return real_credit(conn_, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_credit", failing_credit)
+    with pytest.raises(RuntimeError, match="simulated storage failure"):
+        scheduler.preview_batch(now=at(10))
+
+    # No partial change survived: job states, balances, checkpoints and the
+    # would-be batch/ledger rows are all gone with the transaction.
+    assert _full_snapshot() == snap
+    assert scheduler.list_jobs()[0]["status"] == "QUEUED"
+    assert scheduler.list_tenants()[0]["balance_gpu_min"] == 0.0
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) FROM batches").fetchone()[0] == 0
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) FROM ledger").fetchone()[0] == 0
+
+    # Service still healthy; the next batch starts cleanly at id 1.
+    r = scheduler.run_batch(now=at(11))
+    assert r["batch_id"] == 1 and r["selection_order"] == ["J000001"]

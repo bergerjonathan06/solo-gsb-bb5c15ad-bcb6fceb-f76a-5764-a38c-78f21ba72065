@@ -371,3 +371,105 @@ def test_tenant_cap_validation_http(client):
     # New tenant without the field is unlimited (default behaviour).
     r = client.post("/tenants", json={"tenant_id": "y", "weight": 1})
     assert r.status_code == 201 and r.json()["max_gpus"] is None
+
+
+def _event_signature(events):
+    """Event identity that ignores row ids/batch ids (previews null both).
+
+    Aging amounts are dropped: over HTTP the preview and the real batch run a
+    few milliseconds apart, so wall-clock aging legitimately differs by a
+    sub-second sliver (the preview/batch consistency guarantee is conditioned
+    on the same reference instant). Quantum/dispatch amounts are deterministic.
+    """
+    return [
+        (e["kind"], e["tenant_id"], e["job_id"],
+         None if e["kind"] == "AGING" else round(e["amount"], 6))
+        for e in events
+    ]
+
+
+def test_preview_endpoint_dry_run_matches_batch_http(client):
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30,
+        "weight": 1}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 6, "duration_min": 10,
+        "weight": 2}).json()["id"]
+
+    p = client.post("/scheduler/preview")
+    assert p.status_code == 200, p.text
+    preview = p.json()
+    assert preview["preview"] is True
+    assert preview["batch_id"] is None
+    assert preview["selection_order"] == [j1, j2]
+    assert preview["used_gpus_after"] == 8
+    assert preview["free_gpus_after"] == 0
+    assert all(e["id"] is None and e["batch_id"] is None
+               for e in preview["events"])
+    assert all(j["batch_id"] is None and j["status"] == "RUNNING"
+               for j in preview["selected_jobs"])
+
+    # Dry run: nothing changed in the database.
+    assert client.get("/scheduler/state").json()["used_gpus"] == 0
+    assert all(j["status"] == "QUEUED" for j in client.get("/jobs").json())
+    assert client.get("/ledger").json() == []
+
+    # The subsequent real batch makes the identical decision.
+    b = client.post("/scheduler/batch")
+    assert b.status_code == 200
+    batch = b.json()
+    assert "preview" not in batch
+    assert batch["batch_id"] == 1
+    assert batch["selection_order"] == preview["selection_order"]
+    assert batch["rounds"] == preview["rounds"]
+    assert batch["used_gpus_after"] == preview["used_gpus_after"]
+    assert _event_signature(batch["events"]) == _event_signature(
+        preview["events"])
+    bt = {t["id"]: t["balance_gpu_min"] for t in batch["tenants"]}
+    pt = {t["id"]: t["balance_gpu_min"] for t in preview["tenants"]}
+    assert bt == pytest.approx(pt, abs=0.5)
+    # And now the jobs really are RUNNING with a recorded batch id.
+    assert client.get(f"/jobs/{j1}").json()["status"] == "RUNNING"
+    assert client.get(f"/jobs/{j1}").json()["batch_id"] == 1
+
+
+def test_preview_empty_queue_http(client):
+    r = client.post("/scheduler/preview")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["preview"] is True and body["batch_id"] is None
+    assert body["selection_order"] == []
+    assert body["selected_jobs"] == [] and body["events"] == []
+    # No batch row was consumed: the first real batch is id 1.
+    assert client.post("/scheduler/batch").json()["batch_id"] == 1
+
+
+def test_preview_cap_blocked_is_side_effect_free_http(client):
+    client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "max_gpus": 2})
+    client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 5})
+    client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 5})
+
+    # Repeated previews consistently select only the cap-fitting head and
+    # hand out no quantum beyond what leads to that dispatch, without
+    # persisting anything.
+    first = client.post("/scheduler/preview").json()
+    assert first["selection_order"] == ["J000001"]
+    # The single QUANTUM is the one that funds J000001's dispatch; there is no
+    # trailing quantum for the cap-blocked J000002.
+    quanta = [e for e in first["events"] if e["kind"] == "QUANTUM"]
+    assert len(quanta) == 1
+    again = client.post("/scheduler/preview").json()
+    assert again["selection_order"] == first["selection_order"]
+    assert client.get("/ledger").json() == []
+    state = client.get("/scheduler/state").json()
+    assert state["used_gpus"] == 0
+    a = next(t for t in state["tenants"] if t["id"] == "team-a")
+    assert a["balance_gpu_min"] == 0.0 and a["running_gpus"] == 0
+
+    # Real batch: same single dispatch, now persisted.
+    batch = client.post("/scheduler/batch").json()
+    assert batch["selection_order"] == first["selection_order"]
+    assert client.get("/tenants/team-a").json()["running_gpus"] == 2

@@ -201,6 +201,20 @@ def schedule_next_batch():
     return scheduler.run_batch()
 
 
+@app.post("/scheduler/preview", tags=["scheduler"])
+def preview_next_batch():
+    """Dry-run one WDRR+aging batch without persisting anything.
+
+    Uses the exact same WDRR, aging, per-tenant GPU-cap and dependency logic
+    as ``POST /scheduler/batch``: the projection is computed inside a
+    transaction that is always rolled back, so job states, balances, aging
+    checkpoints, batches and ledger rows stay unchanged (including on error).
+    Against the same database state and reference instant, a subsequent real
+    batch makes identical decisions.
+    """
+    return scheduler.preview_batch()
+
+
 @app.get("/ledger", tags=["scheduler"])
 def get_ledger(
     tenant_id: str | None = None,
